@@ -5,16 +5,22 @@ from functions.detect_inside_boxes import detect_if_the_signature_is_there
 from functions.draw_result import draw_results
 from os import listdir, mkdir
 from os.path import exists
+from shutil import rmtree
 import re
 
-IMAGE_PATH = "data/FORM1/EXAM_FORM1_PRESENCES/EXAM_FORM1_19283.jpeg"
-DARK_THRESHOLD = 0.45
 MIN_CHECKED_EXTRA_RATIO = 1.20
 SIGNATURE_MIN_INK_RATIO = 0.006
 SOURCE_PATH_DATA = "data/"
 
 source_dir = listdir(SOURCE_PATH_DATA)
 source_dir = [form for form in source_dir if re.match(r"^FORM\d$", form)]
+
+rmtree("signature_fails")
+rmtree("id_fails")
+if not exists("signature_fails"):
+    mkdir("signature_fails")
+if not exists("id_fails"):
+    mkdir("id_fails")
 
 list_etudiant_valide = []
 list_etudiant_non_valide = []
@@ -27,7 +33,7 @@ for form in source_dir:
         current_presence_page_path = f"{temp_dir_path}{current_presence_page}"
         print(current_presence_page_path)
         try:
-            img_binaire = load_binary_image(current_presence_page_path, DARK_THRESHOLD)
+            img_binaire = load_binary_image(current_presence_page_path)
         except:
             print("format photo bug")
             break
@@ -37,10 +43,6 @@ for form in source_dir:
         the_small_boxes_for_the_id_number = find_square_boxes(items_regions)
         student_id, grid_info = read_student_id(the_small_boxes_for_the_id_number, img_binaire.shape, MIN_CHECKED_EXTRA_RATIO)
         
-        if not exists("signature_fails"):
-            mkdir("signature_fails")
-        if not exists("id_fails"):
-            mkdir("id_fails")
         if student_id == None:
             list_etudiant_non_valide.append((student_id, current_presence_page))
             draw_results(img_binaire, signature_box, grid_info, f"id_fails/{current_presence_page}")

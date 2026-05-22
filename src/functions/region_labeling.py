@@ -19,11 +19,9 @@ def find_signature_box(item_regions, image_shape):
 
         is_trop_large = w > 0.20 * W and h > 0.08 * H
         is_pas_assez_large = w < 0.50 * W and h < 0.25 * H
-        gauche_de_limage = minc < 0.50 * W
-        haut_de_limage = minr < 0.55 * H
         ratio_correct = 1.2 < (w / h) < 3.5
 
-        if is_trop_large and is_pas_assez_large and gauche_de_limage and haut_de_limage and ratio_correct:
+        if is_trop_large and is_pas_assez_large and ratio_correct:
             signature_box_possibilities.append((minc, minr, maxc, maxr))
 
     if len(signature_box_possibilities) == 0:
