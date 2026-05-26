@@ -1,4 +1,5 @@
 import numpy as np
+from functions.detect_inside_boxes import ink_ratio_inside_box
 
 def group_positions(values, max_gap):
     values = sorted(values)
@@ -21,7 +22,7 @@ def group_positions(values, max_gap):
     centers = [float(np.mean(g)) for g in groups]
     return centers
 
-def find_student_id_grid(square_boxes, image_shape):
+def find_student_id_grid_v2(square_boxes, image_shape):
     H, W = image_shape
 
     candidates = [
@@ -29,35 +30,46 @@ def find_student_id_grid(square_boxes, image_shape):
         if b["cx"] > 0.60 * W and b["cy"] < 0.55 * H
     ]
 
-    x_centers = group_positions([b["cx"] for b in candidates], max_gap=22)
-    y_centers = group_positions([b["cy"] for b in candidates], max_gap=25)
+    if len(candidates) < 25:
+        return None, None, None
 
-    x_centers = sorted(x_centers)
-    y_centers = sorted(y_centers)
+    x_centers = cluster_1d_fixed([b["cx"] for b in candidates], k=5)
+    y_centers = cluster_1d_fixed([b["cy"] for b in candidates], k=10)
 
-    # On garde les 5 colonnes de la grille Student ID
-    if len(x_centers) > 5:
-        x_centers = x_centers[-5:]
-
-    # Correction importante :
-    # Si une ligne parasite est détectée au-dessus des chiffres 0-9,
-    # on la supprime.
-    if len(y_centers) == 11:
-        y_centers = y_centers[1:11]
-
-    # Sécurité si plus de 11 lignes sont trouvées
-    elif len(y_centers) > 11:
-        y_centers = y_centers[-10:]
-
-    # Cas normal
-    elif len(y_centers) > 10:
-        y_centers = y_centers[1:11]
-
-    if len(x_centers) != 5 or len(y_centers) != 10:
+    if x_centers is None or y_centers is None:
         return None, None, None
 
     return candidates, x_centers, y_centers
 
+def cluster_1d_fixed(values, k, max_iter=50):
+    values = np.array(sorted(values), dtype=float)
+
+    if len(values) < k:
+        return None
+
+    # Initialisation par percentiles
+    centers = np.percentile(values, np.linspace(0, 100, k))
+
+    for _ in range(max_iter):
+        distances = np.abs(values[:, None] - centers[None, :])
+        labels = np.argmin(distances, axis=1)
+
+        new_centers = []
+        for i in range(k):
+            group = values[labels == i]
+            if len(group) == 0:
+                new_centers.append(centers[i])
+            else:
+                new_centers.append(np.mean(group))
+
+        new_centers = np.array(new_centers)
+
+        if np.allclose(centers, new_centers):
+            break
+
+        centers = new_centers
+
+    return sorted(centers.tolist())
 
 def nearest_box(boxes, x, y):
     best_box = None
@@ -72,9 +84,8 @@ def nearest_box(boxes, x, y):
 
     return best_box
 
-
-def read_student_id(square_boxes, image_shape, min_ratio):
-    candidates, x_centers, y_centers = find_student_id_grid(square_boxes, image_shape)
+def read_student_id_v2(img_binaire, square_boxes, image_shape, min_ratio=1.8):
+    candidates, x_centers, y_centers = find_student_id_grid_v2(square_boxes, image_shape)
 
     if candidates is None:
         return None, None
@@ -84,7 +95,13 @@ def read_student_id(square_boxes, image_shape, min_ratio):
     for row, y in enumerate(y_centers):
         for col, x in enumerate(x_centers):
             b = nearest_box(candidates, x, y)
-            matrix[row, col] = b["area"]
+
+            # Sécurité : ne pas accepter une boîte trop loin du centre attendu
+            dist = ((b["cx"] - x) ** 2 + (b["cy"] - y) ** 2) ** 0.5
+            if dist > 18:
+                matrix[row, col] = 0
+            else:
+                matrix[row, col] = ink_ratio_inside_box(img_binaire, b["bbox"])
 
     digits = []
 
@@ -95,7 +112,8 @@ def read_student_id(square_boxes, image_shape, min_ratio):
         best_value = column_values[best_row]
         median_value = np.median(column_values)
 
-        if best_value > median_value * min_ratio:
+        # Une case cochée doit être clairement plus remplie que les autres
+        if best_value > max(0.08, median_value * min_ratio):
             digits.append(str(best_row))
         else:
             digits.append("?")
