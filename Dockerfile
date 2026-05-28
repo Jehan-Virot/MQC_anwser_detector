@@ -11,7 +11,7 @@ RUN groupadd -g $USER_GID jehan \
 # Installer Python packages
 WORKDIR /workspace
 RUN pip install --upgrade pip
-RUN pip install notebook jupyterlab pandas numpy matplotlib scipy scikit-image scikit-learn
+RUN pip install notebook jupyterlab pandas numpy matplotlib scipy scikit-image scikit-learn tensorflow
 
 # Donner les droits sur le dossier de travail
 RUN chown -R jehan:jehan /workspace
