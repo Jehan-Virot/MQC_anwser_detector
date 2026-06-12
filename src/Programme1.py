@@ -14,6 +14,9 @@ import re
 import csv
 import itertools
 import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+import json
 from skimage import io, color, transform, exposure, filters, measure, morphology, draw
 
 
@@ -21,6 +24,7 @@ from skimage import io, color, transform, exposure, filters, measure, morphology
 # PARAMETRES
 # ============================================================
 SOURCE_PATH_DATA = "data/"
+SOURCE_PATH_CNN = "data/src/signature_model/"
 
 SIGNATURE_FAILS_DIR = "signature_fails"
 ID_FAILS_DIR = "id_fails"
@@ -503,6 +507,24 @@ def draw_results(img_gray, signature_box, grid_info, out_path):
 
     io.imsave(out_path, (rgb * 255).astype(np.uint8))
 
+# ============================================================
+# deep learning
+# ============================================================
+
+def load_model_and_label(path):
+    signature_model = keras.models.load_model(f"{path}signature_cnn_bast.keras")
+    
+    with open(f"{path}labels.json") as f:
+        labels = json.load(f)
+        f.close()
+
+    return signature_model, labels
+
+def predict_signature(to_be_predicted, model: keras.Model, labels):
+    prediction = model.predict(to_be_predicted)
+    numero_etudiant_predit = labels[prediction]
+    return numero_etudiant_predit
+
 
 # ============================================================
 # MAIN MERGE
@@ -530,7 +552,10 @@ def main():
     list_etudiant_non_valide = []
     list_etudiant_signature = []
     list_etudiant_non_signature = []
-
+    list_etudiant_dl_valide = []
+    list_etudiant_dl_non_valide = []
+    
+    
     csv_rows = []
 
     for form in source_dir:
@@ -574,6 +599,13 @@ def main():
                 "status": id_result.get("status"),
             }
 
+            model_signature, labels = load_model_and_label(SOURCE_PATH_CNN)
+            id_student_predict = predict_signature(signature_box, model_signature, labels)
+            
+            if int(id_student_predict) == int(student_id):
+                list_etudiant_dl_valide.append((form, student_id))
+            else:
+                list_etudiant_dl_non_valide.append((form, student_id, id_student_predict))
             # Validation ID avec le nom de fichier, comme dans ton main
             if student_id is None:
                 list_etudiant_non_valide.append((student_id, current_presence_page, id_result["status"]))
