@@ -18,3 +18,6 @@ RUN chown -R jehan:jehan /workspace
 
 # Switch user pour que tout tourne avec jehan
 USER jehan
+
+RUN pip install pymupdf pytesseract openpyxl
+RUN apt-get update && apt-get install -y tesseract-ocr
