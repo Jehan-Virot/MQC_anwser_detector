@@ -14,11 +14,13 @@ import re
 import csv
 import itertools
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-import json
 from skimage import io, color, transform, exposure, filters, measure, morphology, draw
-
+from predict_svm import (
+    load_model,
+    load_reference_signatures,
+    crop_signature_from_page,
+    predict_signature_id
+)
 
 # ============================================================
 # PARAMETRES
@@ -49,7 +51,7 @@ MIN_CHECK_RATIO = 0.030
 # Pour ne pas compter le contour imprimé de chaque case.
 INNER_PAD_RATIO = 0.27
 
-
+SIGNATURE_CROPS_DEBUG_DIR = "signature_crops_debug"
 # ============================================================
 # OUTILS GENERAUX IMAGE
 # ============================================================
@@ -113,8 +115,8 @@ def binarize_dark_pixels_for_id(img_gray, threshold_factor=0.92):
     threshold = otsu * threshold_factor
 
     img_bin = img_stretched < threshold
-    img_bin = morphology.remove_small_objects(img_bin, min_size=8)
-    img_bin = morphology.binary_closing(img_bin, morphology.square(2))
+    img_bin = morphology.remove_small_objects(img_bin, max_size=8)
+    img_bin = morphology.closing(img_bin, morphology.footprint_rectangle((2,2)))
     return img_bin
 
 
@@ -186,7 +188,7 @@ def crop_id_roi(img):
 def find_square_candidates(img_bin):
     """Trouve des candidats de cases carrées dans la ROI Student ID."""
     roi, _ = crop_id_roi(img_bin)
-    roi_clean = morphology.binary_closing(roi, morphology.square(2))
+    roi_clean = morphology.closing(roi, morphology.footprint_rectangle((2,2)))
 
     labels = measure.label(roi_clean, connectivity=2)
     props = measure.regionprops(labels)
@@ -507,28 +509,43 @@ def draw_results(img_gray, signature_box, grid_info, out_path):
 
     io.imsave(out_path, (rgb * 255).astype(np.uint8))
 
-# ============================================================
-# deep learning
-# ============================================================
 
-def load_model_and_label(path):
-    signature_model = keras.models.load_model(f"{path}signature_cnn_bast.keras")
-    
-    with open(f"{path}labels.json") as f:
-        labels = json.load(f)
-        f.close()
 
-    return signature_model, labels
+#JPP
 
-def predict_signature(to_be_predicted, model: keras.Model, labels):
-    prediction = model.predict(to_be_predicted)
-    numero_etudiant_predit = labels[prediction]
-    return numero_etudiant_predit
+
+def crop_trim_signature(img_gray, signature_box, trim_ratio=0.07):
+    if signature_box is None:
+        return None
+
+    x1, y1, x2, y2 = signature_box
+
+    h_img, w_img = img_gray.shape[:2]
+    x1, x2 = max(0, x1), min(w_img, x2)
+    y1, y2 = max(0, y1), min(h_img, y2)
+
+    crop = img_gray[y1:y2, x1:x2]
+
+    if crop.size == 0:
+        return None
+
+    h, w = crop.shape[:2]
+
+    trim_y = int(trim_ratio * h)
+    trim_x = int(trim_ratio * w)
+
+    crop = crop[trim_y:h-trim_y, trim_x:w-trim_x]
+
+    if crop.size == 0:
+        return None
+
+    return crop
 
 
 # ============================================================
 # MAIN MERGE
 # ============================================================
+
 def filename_contains_student_id(filename, student_id):
     return student_id is not None and filename.find(student_id) != -1
 
@@ -536,6 +553,9 @@ def filename_contains_student_id(filename, student_id):
 def main():
     ensure_clean_dir(SIGNATURE_FAILS_DIR)
     ensure_clean_dir(ID_FAILS_DIR)
+
+    signature_model = load_model("signature_model_svm/svm_shape.joblib")
+    reference_signatures = load_reference_signatures("signature_model_svm/labels.json")
 
     if SAVE_OK_DEBUG:
         ensure_clean_dir(DEBUG_OK_DIR)
@@ -599,14 +619,7 @@ def main():
                 "status": id_result.get("status"),
             }
 
-            model_signature, labels = load_model_and_label(SOURCE_PATH_CNN)
-            id_student_predict = predict_signature(signature_box, model_signature, labels)
             
-            if int(id_student_predict) == int(student_id):
-                list_etudiant_dl_valide.append((form, student_id))
-            else:
-                list_etudiant_dl_non_valide.append((form, student_id, id_student_predict))
-            # Validation ID avec le nom de fichier, comme dans ton main
             if student_id is None:
                 list_etudiant_non_valide.append((student_id, current_presence_page, id_result["status"]))
                 out_path = join(ID_FAILS_DIR, current_presence_page)
@@ -625,11 +638,47 @@ def main():
             if has_signature:
                 list_etudiant_signature.append(student_id)
                 signature_status = "signature_detectee"
+
+                signature_crop = crop_trim_signature(
+                    img_gray,
+                    signature_box
+                )
+                
+                student_id_signature, signature_score, _ = predict_signature_id(
+                    signature_model,
+                    reference_signatures,
+                    signature_crop,
+                    threshold=0.0
+                )
+
+                print("ID signature prédit :", student_id_signature, "score :", signature_score)
+
+                if student_id is not None and student_id_signature is not None:
+                    if str(student_id) == str(student_id_signature):
+                        list_etudiant_dl_valide.append(student_id)
+                        signature_dl_status = "signature_id_match"
+                    else:
+                        list_etudiant_dl_non_valide.append(
+                            (current_presence_page, student_id, student_id_signature, signature_score)
+                        )
+                        signature_dl_status = "signature_id_mismatch"
+                else:
+                    list_etudiant_dl_non_valide.append(
+                        (current_presence_page, student_id, student_id_signature, signature_score)
+                    )
+                    signature_dl_status = "signature_id_missing"
+
             else:
+                student_id_signature = None
+                signature_score = 0.0
+                signature_dl_status = "signature_non_detectee"
+
                 list_etudiant_non_signature.append((student_id, current_presence_page))
                 out_path = join(SIGNATURE_FAILS_DIR, current_presence_page)
                 draw_results(img_gray, signature_box, grid_info, out_path)
                 signature_status = "signature_non_detectee"
+
+                print("ID signature prédit :", student_id_signature, "score :", signature_score)
 
             if SAVE_OK_DEBUG and id_valid and has_signature:
                 base, ext = splitext(current_presence_page)
@@ -639,16 +688,13 @@ def main():
             csv_rows.append([
                 current_presence_page,
                 student_id if student_id is not None else "",
-                "id_ok" if id_valid else id_result["status"],
-                "yes" if has_signature else "no",
-                signature_status,
-                ink_ratio,
+                student_id_signature if student_id_signature is not None else "",
             ])
 
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter=";")
-        writer.writerow(["imageName", "studentID_grid", "studentID_status", "has_signature", "signature_status", "signature_ink_ratio"])
-        writer.writerows(csv_rows)
+            with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["imageName","studentID_grid","studentID_signature"])
+                writer.writerows(csv_rows)
 
     total_id = len(list_etudiant_valide) + len(list_etudiant_non_valide)
     total_sig = len(list_etudiant_signature) + len(list_etudiant_non_signature)
