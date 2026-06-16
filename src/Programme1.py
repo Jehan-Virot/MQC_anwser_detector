@@ -1,716 +1,212 @@
-# main_merged_student_id_signature.py
-# Un seul fichier pour :
-# 1) lire le Student ID via la grille 5 x 10
-# 2) détecter la présence d'une signature
-# 3) parcourir data/FORMx/EXAM_FORMx_PRESENCES/
-#
-# Méthodes utilisées : niveaux de gris, étirement d'histogramme, seuillage Otsu,
-# morphologie simple, labelling, regroupement de coordonnées / profils.
+from pathlib import Path
+from os import path
+from predict_similarity import predict_signature_from_box, load_similarity_model
+from functions.debugging_programme1 import draw_results
+from functions.id_grid_pipeline import read_student_id_grid_from_path
+from functions.labels import find_regions
+from functions.outils_generaux_images import load_binary_image, load_gray_image
+from functions.signature_box_pipeline import find_signature_box, detect_if_the_signature_is_there
+from functions.outils_format_XLSX import append_presence_row, create_presence_workbook
 
-from os import listdir, mkdir
-from os.path import exists, isdir, join, splitext
-from shutil import rmtree
-import re
-import csv
-import itertools
-import numpy as np
-from skimage import io, color, transform, exposure, filters, measure, morphology, draw
-from predict_svm import (
-    load_model,
-    load_reference_signatures,
-    crop_signature_from_page,
-    predict_signature_id
-)
-
-# ============================================================
-# PARAMETRES
-# ============================================================
-SOURCE_PATH_DATA = "data/"
-SOURCE_PATH_CNN = "data/src/signature_model/"
-
-SIGNATURE_FAILS_DIR = "signature_fails"
-ID_FAILS_DIR = "id_fails"
-DEBUG_OK_DIR = "id_debug_ok"       # mets SAVE_OK_DEBUG = False si tu n'en veux pas
-OUTPUT_CSV = "presence_results.csv"
-
-SAVE_OK_DEBUG = False
+#parameters
+VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", "JPG", ".png", ".tif", ".tiff"}
 SIGNATURE_MIN_INK_RATIO = 0.006
-
-# Zone approximative de la grille STUDENT ID dans une page portrait.
-# x_min, y_min, x_max, y_max en pourcentage de largeur / hauteur.
-ID_ROI_RATIO = (0.66, 0.10, 0.99, 0.56)
-
-N_COLS = 5
-N_ROWS = 10
-
-# Seuil minimum pour considérer une case comme cochée.
-# Si tes croix sont fines/faibles : descendre vers 0.020-0.025.
-# Si le fond gris est souvent pris comme encre : monter vers 0.035-0.045.
-MIN_CHECK_RATIO = 0.030
-
-# Pour ne pas compter le contour imprimé de chaque case.
-INNER_PAD_RATIO = 0.27
-
-SIGNATURE_CROPS_DEBUG_DIR = "signature_crops_debug"
-# ============================================================
-# OUTILS GENERAUX IMAGE
-# ============================================================
-def ensure_clean_dir(path):
-    if exists(path):
-        rmtree(path)
-    mkdir(path)
-
-
-def rgb_to_gray_and_normalize(img):
-    if img.ndim == 3:
-        return color.rgb2gray(img)
-    img = img.astype(float)
-    if img.max() > 1.0:
-        img = img / 255.0
-    return img
-
-
-def turn_image_if_needed(img):
-    H, W = img.shape[:2]
-    if W > H:
-        img = transform.rotate(img, angle=270, resize=True, preserve_range=True)
-    return img
-
-
-def stretch_histo(img_gray, p_low=5, p_high=95):
-    low, high = np.percentile(img_gray, (p_low, p_high))
-    if high <= low:
-        return img_gray
-    return exposure.rescale_intensity(img_gray, in_range=(low, high), out_range=(0, 1))
-
-
-def load_gray_image(path):
-    img = io.imread(path)
-    img_gray = rgb_to_gray_and_normalize(img)
-    img_gray = turn_image_if_needed(img_gray)
-    return img_gray
-
-
-def load_binary_image(path):
-    """
-    Version intégrée de ton chargement :
-    image -> gris -> stretching -> Otsu -> True pour les pixels noirs.
-    """
-    img_gray = load_gray_image(path)
-    img_stretched = stretch_histo(img_gray)
-    threshold = filters.threshold_otsu(img_stretched)
-    img_binaire = img_stretched < threshold
-    return img_binaire
-
-
-def binarize_dark_pixels_for_id(img_gray, threshold_factor=0.92):
-    """
-    Binarisation de la zone ID.
-
-    threshold_factor < 1 rend le seuil plus strict que Otsu : on garde surtout le noir.
-    Plusieurs valeurs sont essayées plus bas, car certaines photos ont un contraste très différent.
-    """
-    img_stretched = stretch_histo(img_gray, p_low=3, p_high=97)
-    otsu = filters.threshold_otsu(img_stretched)
-    threshold = otsu * threshold_factor
-
-    img_bin = img_stretched < threshold
-    img_bin = morphology.remove_small_objects(img_bin, max_size=8)
-    img_bin = morphology.closing(img_bin, morphology.footprint_rectangle((2,2)))
-    return img_bin
-
-
-# ============================================================
-# SIGNATURE
-# ============================================================
-def find_regions(img_binaire):
-    labels = measure.label(img_binaire, connectivity=2)
-    return measure.regionprops(labels)
-
-
-def find_signature_box(item_regions, image_shape):
-    H, W = image_shape
-    signature_box_possibilities = []
-
-    for p in item_regions:
-        minr, minc, maxr, maxc = p.bbox
-        h = maxr - minr
-        w = maxc - minc
-
-        is_trop_large = w > 0.20 * W and h > 0.08 * H
-        is_pas_assez_large = w < 0.50 * W and h < 0.25 * H
-        ratio_correct = h > 0 and 1.2 < (w / h) < 3.5
-
-        if is_trop_large and is_pas_assez_large and ratio_correct:
-            signature_box_possibilities.append((minc, minr, maxc, maxr))
-
-    if len(signature_box_possibilities) == 0:
-        return None
-
-    # On garde la dernière possibilité comme dans ton code.
-    x1, y1, x2, y2 = signature_box_possibilities[-1]
-    return x1, y1, x2, y2
-
-
-def detect_if_the_signature_is_there(img_binaire, signature_box, ratio_pixel=SIGNATURE_MIN_INK_RATIO):
-    if signature_box is None:
-        return False, 0.0
-
-    x1, y1, x2, y2 = signature_box
-    w = x2 - x1
-    h = y2 - y1
-
-    pad_x = int(0.08 * w)
-    pad_y = int(0.08 * h)
-
-    inside = img_binaire[y1 + pad_y:y2 - pad_y, x1 + pad_x:x2 - pad_x]
-    if inside.size == 0:
-        return False, 0.0
-
-    ink_ratio = inside.sum() / inside.size
-    present = ink_ratio > ratio_pixel
-    return present, ink_ratio
-
-
-# ============================================================
-# DETECTION STUDENT ID : GRILLE 5 x 10
-# ============================================================
-def crop_id_roi(img):
-    H, W = img.shape[:2]
-    rx1, ry1, rx2, ry2 = ID_ROI_RATIO
-    x1 = int(rx1 * W)
-    y1 = int(ry1 * H)
-    x2 = int(rx2 * W)
-    y2 = int(ry2 * H)
-    return img[y1:y2, x1:x2], (x1, y1, x2, y2)
-
-
-def find_square_candidates(img_bin):
-    """Trouve des candidats de cases carrées dans la ROI Student ID."""
-    roi, _ = crop_id_roi(img_bin)
-    roi_clean = morphology.closing(roi, morphology.footprint_rectangle((2,2)))
-
-    labels = measure.label(roi_clean, connectivity=2)
-    props = measure.regionprops(labels)
-
-    H, W = roi.shape
-    candidates = []
-
-    for p in props:
-        minr, minc, maxr, maxc = p.bbox
-        h = maxr - minr
-        w = maxc - minc
-        area = p.area
-
-        min_side = max(10, int(0.015 * H))
-        max_side = max(25, int(0.110 * H))
-
-        ratio = w / h if h > 0 else 0
-        extent = area / float(w * h) if w * h > 0 else 0
-
-        if min_side <= w <= max_side and min_side <= h <= max_side:
-            if 0.65 <= ratio <= 1.45 and 0.08 <= extent <= 0.75:
-                candidates.append({
-                    "bbox": (minc, minr, maxc, maxr),
-                    "cx": (minc + maxc) / 2.0,
-                    "cy": (minr + maxr) / 2.0,
-                    "w": w,
-                    "h": h,
-                    "area": area,
-                })
-
-    return candidates
-
-
-def group_values(values, max_gap):
-    if len(values) == 0:
-        return []
-
-    values = sorted(values)
-    groups = [[values[0]]]
-
-    for v in values[1:]:
-        if abs(v - np.mean(groups[-1])) <= max_gap:
-            groups[-1].append(v)
-        else:
-            groups.append([v])
-
-    return [{"center": float(np.mean(g)), "count": len(g), "values": g} for g in groups]
-
-
-def select_regular_clusters(clusters, n_expected):
-    """Sélectionne n_expected groupes formant une grille régulière."""
-    if len(clusters) < n_expected:
-        return None
-
-    clusters = sorted(clusters, key=lambda c: c["center"])
-    best_combo = None
-    best_cost = float("inf")
-    max_count = max(c["count"] for c in clusters)
-
-    for combo in itertools.combinations(clusters, n_expected):
-        centers = np.array([c["center"] for c in combo], dtype=float)
-        gaps = np.diff(centers)
-        if np.any(gaps <= 0):
-            continue
-
-        mean_gap = np.mean(gaps)
-        if mean_gap <= 0:
-            continue
-
-        regularity_cost = np.std(gaps) / mean_gap
-        count_bonus = sum(c["count"] for c in combo) / float(n_expected * max_count)
-        cost = regularity_cost - 0.10 * count_bonus
-
-        if cost < best_cost:
-            best_cost = cost
-            best_combo = combo
-
-    if best_combo is None:
-        return None
-
-    return sorted([float(c["center"]) for c in best_combo])
-
-
-def fit_affine_grid_from_candidates(candidates, image_shape):
-    """
-    Reconstruit la grille comme un petit repère affine.
-
-    Avant, on prenait uniquement des lignes/colonnes parfaitement horizontales et verticales.
-    Si la photo est prise de travers, les centres des cases forment plutôt un parallélogramme.
-    Ici on estime donc :
-        centre(row, col) = origine + col * vecteur_colonne + row * vecteur_ligne
-    Cela corrige les décalages progressifs qui faisaient tomber l'intérieur d'une case entre 2 cases.
-    """
-    if len(candidates) < 12:
-        return None
-
-    H_img, W_img = image_shape
-    _, (rx1, ry1, _, _) = crop_id_roi(np.zeros(image_shape, dtype=bool))
-
-    sides = np.array([0.5 * (c["w"] + c["h"]) for c in candidates], dtype=float)
-    median_side = float(np.median(sides))
-    group_tol = max(6, 0.75 * median_side)
-
-    x_groups = group_values([c["cx"] for c in candidates], group_tol)
-    y_groups = group_values([c["cy"] for c in candidates], group_tol)
-
-    x_centers = select_regular_clusters(x_groups, N_COLS)
-    y_centers = select_regular_clusters(y_groups, N_ROWS)
-    if x_centers is None or y_centers is None:
-        return None
-
-    assigned = []
-    for c in candidates:
-        col = int(np.argmin([abs(c["cx"] - xc) for xc in x_centers]))
-        row = int(np.argmin([abs(c["cy"] - yc) for yc in y_centers]))
-        if abs(c["cx"] - x_centers[col]) <= 1.4 * group_tol and abs(c["cy"] - y_centers[row]) <= 1.4 * group_tol:
-            assigned.append((row, col, c["cx"], c["cy"]))
-
-    if len(assigned) < 12:
-        return None
-
-    # Matrice de moindres carrés : x = a0 + a1*col + a2*row, y = b0 + b1*col + b2*row
-    A = np.array([[1.0, col, row] for row, col, _, _ in assigned], dtype=float)
-    bx = np.array([x for _, _, x, _ in assigned], dtype=float)
-    by = np.array([y for _, _, _, y in assigned], dtype=float)
-
-    coef_x, _, _, _ = np.linalg.lstsq(A, bx, rcond=None)
-    coef_y, _, _, _ = np.linalg.lstsq(A, by, rcond=None)
-
-    # Qualité du modèle : si l'erreur est énorme, on ne force pas.
-    pred_x = A @ coef_x
-    pred_y = A @ coef_y
-    err = np.sqrt((pred_x - bx) ** 2 + (pred_y - by) ** 2)
-    if float(np.median(err)) > 0.75 * median_side:
-        return None
-
-    side = median_side * 1.08
-    grid = []
-    for row in range(N_ROWS):
-        line = []
-        for col in range(N_COLS):
-            x = coef_x[0] + coef_x[1] * col + coef_x[2] * row
-            y = coef_y[0] + coef_y[1] * col + coef_y[2] * row
-            x1 = int(round(rx1 + x - side / 2))
-            y1 = int(round(ry1 + y - side / 2))
-            x2 = int(round(rx1 + x + side / 2))
-            y2 = int(round(ry1 + y + side / 2))
-            x1 = max(0, min(W_img - 1, x1))
-            x2 = max(0, min(W_img, x2))
-            y1 = max(0, min(H_img - 1, y1))
-            y2 = max(0, min(H_img, y2))
-            line.append((x1, y1, x2, y2))
-        grid.append(line)
-
-    return grid
-
-
-def reconstruct_id_grid(img_bin):
-    """
-    Retourne une grille 10 x 5 de bounding boxes absolues.
-    Version robuste : elle utilise un modèle affine de grille, donc elle tolère une petite rotation
-    ou perspective de la photo.
-    """
-    candidates = find_square_candidates(img_bin)
-    grid = fit_affine_grid_from_candidates(candidates, img_bin.shape)
-    return grid, candidates
-
-
-def ink_ratio_inside_box(img_bin, bbox, pad_ratio=INNER_PAD_RATIO):
-    H, W = img_bin.shape
-    x1, y1, x2, y2 = bbox
-
-    x1 = max(0, min(W - 1, x1))
-    x2 = max(0, min(W, x2))
-    y1 = max(0, min(H - 1, y1))
-    y2 = max(0, min(H, y2))
-
-    w = x2 - x1
-    h = y2 - y1
-    if w <= 4 or h <= 4:
-        return 0.0
-
-    px = int(pad_ratio * w)
-    py = int(pad_ratio * h)
-
-    inner = img_bin[y1 + py:y2 - py, x1 + px:x2 - px]
-    if inner.size == 0:
-        return 0.0
-
-    return float(np.sum(inner)) / float(inner.size)
-
-
-def read_student_id_from_grid(img_bin, grid):
-    ratios = np.zeros((N_ROWS, N_COLS), dtype=float)
-
-    for row in range(N_ROWS):
-        for col in range(N_COLS):
-            ratios[row, col] = ink_ratio_inside_box(img_bin, grid[row][col])
-
-    digits = []
-    confidence = []
-
-    for col in range(N_COLS):
-        col_ratios = ratios[:, col]
-        best_row = int(np.argmax(col_ratios))
-        sorted_ratios = np.sort(col_ratios)
-        best = float(sorted_ratios[-1])
-        second = float(sorted_ratios[-2]) if len(sorted_ratios) >= 2 else 0.0
-
-        dynamic_threshold = max(
-            MIN_CHECK_RATIO,
-            float(np.mean(col_ratios) + 1.6 * np.std(col_ratios))
+SIGNATURE_SVM_THRESHOLD = 0.0
+SAVE_DEBUG_IMAGES = False
+MODEL_DIR = "signature_model_similarity"
+MODEL_PATH = path.join(MODEL_DIR, "signature_similarity.joblib")
+
+def autoValidID(filename_jpg, STUDENT_CLASS_SIGNATURES, EXAM_FORMXX_PRESENCES_xlsx, EXAM_FORMXX_RESULTS, model):
+    ###############################################
+    #definition des paths
+    
+    img_path = Path(filename_jpg)
+    xlsx_path = Path(EXAM_FORMXX_PRESENCES_xlsx)
+    results_dir = Path(EXAM_FORMXX_RESULTS)
+    image_name = img_path.name
+    student_id_grid = None
+    student_id_signature = None
+    signature_score = 0.0
+    signature_box = None
+    
+    ##############################################
+    #chargement de l'image
+    #dans le cas d'une erreur lors du chargement de l'image on return juste l'image dans le xlsx
+    
+    try:
+        img_gray = load_gray_image(str(img_path))
+        img_binary = load_binary_image(str(img_path))
+    except:
+        append_presence_row(xlsx_path=xlsx_path, image_name=image_name, student_id_grid=None, student_id_signature=None)
+        return {
+            "imageName": image_name,
+            "studentID_grid": None,
+            "studentID_signature": None,
+            "signature_score": 0.0,
+            "status": "image_error",
+        }
+
+    ##############################################
+    #lecture de l'id de l'étudiant via la grille
+    
+    id_result = {
+        "student_id": None,
+        "grid": None,
+        "ratios": None,
+        "status": "not_run",
+    }
+
+    try:
+        id_result = read_student_id_grid_from_path(str(img_path))
+        student_id_grid = id_result.get("student_id")
+    except:
+        student_id_grid = None
+        id_result["status"] = "grid_error"
+
+    ##############################################
+    #detection de la presence de la boite de signature et de la signature
+    
+    has_signature = False
+    ink_ratio = 0.0
+
+    try:
+        items_regions = find_regions(img_binary)
+        signature_box = find_signature_box(items_regions, img_binary.shape)
+        has_signature, ink_ratio = detect_if_the_signature_is_there(img_binary, signature_box, SIGNATURE_MIN_INK_RATIO)
+    except:
+        signature_box = None
+        has_signature = False
+        ink_ratio = 0.0
+
+    ##############################################
+    #reconnaissance de la signature
+    
+    if has_signature and model is not None and student_id_grid not in [None, ""]:
+        student_id_signature, signature_score = predict_signature_from_box(
+            img_gray=img_gray,
+            signature_box=signature_box,
+            model=model,
+            student_id_grid=student_id_grid
         )
-
-        if best >= dynamic_threshold and best >= second + 0.010:
-            digits.append(str(best_row))
-            confidence.append(best - second)
-        else:
-            digits.append("?")
-            confidence.append(best - second)
-
-    return "".join(digits), ratios, confidence
-
-
-def read_student_id_grid_from_path(path):
-    img_gray = load_gray_image(path)
-
-    best_result = None
-    # Plusieurs seuils : robuste aux photos très claires/sombres.
-    # On garde le résultat qui donne une grille + le moins de cases ambiguës + la meilleure confiance.
-    for threshold_factor in (0.82, 0.88, 0.94, 1.00, 1.06):
-        img_bin = binarize_dark_pixels_for_id(img_gray, threshold_factor=threshold_factor)
-        grid, candidates = reconstruct_id_grid(img_bin)
-        if grid is None:
-            current = {
-                "student_id": None,
-                "raw_student_id": None,
-                "status": "grille_non_detectee",
-                "grid": None,
-                "ratios": None,
-                "confidence": [],
-                "img_gray": img_gray,
-                "img_bin": img_bin,
-                "candidates": candidates,
-                "score": -9999,
-            }
-        else:
-            student_id, ratios, confidence = read_student_id_from_grid(img_bin, grid)
-            n_unknown = student_id.count("?")
-            score = 100 - 20 * n_unknown + 100 * float(np.mean(confidence))
-            current = {
-                "student_id": None if n_unknown else student_id,
-                "raw_student_id": student_id,
-                "status": "ok" if n_unknown == 0 else "case_ambigue_" + student_id,
-                "grid": grid,
-                "ratios": ratios,
-                "confidence": confidence,
-                "img_gray": img_gray,
-                "img_bin": img_bin,
-                "candidates": candidates,
-                "score": score,
-                "threshold_factor": threshold_factor,
-            }
-
-        if best_result is None or current["score"] > best_result["score"]:
-            best_result = current
-
-    if best_result is not None:
-        best_result.pop("score", None)
-    return best_result
-
-
-# ============================================================
-# DEBUG VISUEL
-# ============================================================
-def draw_rect_rgb(rgb, bbox, color_value):
-    x1, y1, x2, y2 = bbox
-    rr, cc = draw.rectangle_perimeter(start=(y1, x1), end=(y2, x2), shape=rgb.shape)
-    rgb[rr, cc, 0] = color_value[0]
-    rgb[rr, cc, 1] = color_value[1]
-    rgb[rr, cc, 2] = color_value[2]
-
-
-def draw_results(img_gray, signature_box, grid_info, out_path):
-    """
-    Image debug :
-    - bleu : boîte signature
-    - rouge : cases ID reconstruites
-    - vert : cases choisies pour former l'ID
-    """
-    if img_gray.dtype == bool:
-        base = img_gray.astype(float)
     else:
-        base = img_gray.astype(float)
+        student_id_signature = None
+        signature_score = 0.0
 
-    base = exposure.rescale_intensity(base, out_range=(0, 1))
-    rgb = np.dstack([base, base, base])
-
-    if signature_box is not None:
-        draw_rect_rgb(rgb, signature_box, (0.0, 0.3, 1.0))
-
-    if grid_info is not None and grid_info.get("grid") is not None:
-        grid = grid_info["grid"]
-        ratios = grid_info.get("ratios")
-
-        chosen_rows = []
-        if ratios is not None:
-            for col in range(N_COLS):
-                chosen_rows.append(int(np.argmax(ratios[:, col])))
-
-        for row in range(N_ROWS):
-            for col in range(N_COLS):
-                bbox = grid[row][col]
-                if col < len(chosen_rows) and row == chosen_rows[col]:
-                    draw_rect_rgb(rgb, bbox, (0.0, 1.0, 0.0))
-                else:
-                    draw_rect_rgb(rgb, bbox, (1.0, 0.0, 0.0))
-
-    io.imsave(out_path, (rgb * 255).astype(np.uint8))
-
-
-
-#JPP
-
-
-def crop_trim_signature(img_gray, signature_box, trim_ratio=0.07):
-    if signature_box is None:
-        return None
-
-    x1, y1, x2, y2 = signature_box
-
-    h_img, w_img = img_gray.shape[:2]
-    x1, x2 = max(0, x1), min(w_img, x2)
-    y1, y2 = max(0, y1), min(h_img, y2)
-
-    crop = img_gray[y1:y2, x1:x2]
-
-    if crop.size == 0:
-        return None
-
-    h, w = crop.shape[:2]
-
-    trim_y = int(trim_ratio * h)
-    trim_x = int(trim_ratio * w)
-
-    crop = crop[trim_y:h-trim_y, trim_x:w-trim_x]
-
-    if crop.size == 0:
-        return None
-
-    return crop
-
-
-# ============================================================
-# MAIN MERGE
-# ============================================================
-
-def filename_contains_student_id(filename, student_id):
-    return student_id is not None and filename.find(student_id) != -1
-
-
-def main():
-    ensure_clean_dir(SIGNATURE_FAILS_DIR)
-    ensure_clean_dir(ID_FAILS_DIR)
-
-    signature_model = load_model("signature_model_svm/svm_shape.joblib")
-    reference_signatures = load_reference_signatures("signature_model_svm/labels.json")
-
-    if SAVE_OK_DEBUG:
-        ensure_clean_dir(DEBUG_OK_DIR)
-
-    if not isdir(SOURCE_PATH_DATA):
-        print(f"Dossier introuvable : {SOURCE_PATH_DATA}")
-        return
-
-    source_dir = listdir(SOURCE_PATH_DATA)
-    source_dir = [form for form in source_dir if re.match(r"^FORM\d$", form)]
-    source_dir.sort()
-
-    list_etudiant_valide = []
-    list_etudiant_non_valide = []
-    list_etudiant_signature = []
-    list_etudiant_non_signature = []
-    list_etudiant_dl_valide = []
-    list_etudiant_dl_non_valide = []
+    ##############################################
+    #debug (save les images qui posent problèmes avec la grid créé et la boite de signature détecté et recrée)
     
-    
-    csv_rows = []
-
-    for form in source_dir:
-        temp_dir_path = join(SOURCE_PATH_DATA, form, f"EXAM_{form}_PRESENCES")
-        if not isdir(temp_dir_path):
-            print("Dossier présence introuvable :", temp_dir_path)
-            continue
-
-        presence_pages = sorted(listdir(temp_dir_path))
-
-        for current_presence_page in presence_pages:
-            if not current_presence_page.lower().endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff")):
-                continue
-
-            current_presence_page_path = join(temp_dir_path, current_presence_page)
-            print(current_presence_page_path)
-
-            try:
-                img_gray = load_gray_image(current_presence_page_path)
-                img_binaire = load_binary_image(current_presence_page_path)
-            except Exception as e:
-                print("format photo bug :", e)
-                csv_rows.append([current_presence_page, "", "image_error", "", "image_error", ""])
-                continue
-
-            # Signature
-            items_regions = find_regions(img_binaire)
-            signature_box = find_signature_box(items_regions, img_binaire.shape)
-            has_signature, ink_ratio = detect_if_the_signature_is_there(
-                img_binaire,
-                signature_box,
-                SIGNATURE_MIN_INK_RATIO
-            )
-
-            # Student ID nouvelle méthode grille 5 x 10
-            id_result = read_student_id_grid_from_path(current_presence_page_path)
-            student_id = id_result["student_id"]
+    if SAVE_DEBUG_IMAGES:
+        try:
+            debug_dir = results_dir / "debug_programme1" / img_path.parent.name
+            debug_dir.mkdir(parents=True, exist_ok=True)
             grid_info = {
                 "grid": id_result.get("grid"),
                 "ratios": id_result.get("ratios"),
                 "status": id_result.get("status"),
             }
-
+            out_path = debug_dir / image_name
+            draw_results(img_gray, signature_box, grid_info, str(out_path))
+        except Exception as e:
+            print(f"[WARNING] Impossible de sauvegarder le debug pour {image_name} :", e)
             
-            if student_id is None:
-                list_etudiant_non_valide.append((student_id, current_presence_page, id_result["status"]))
-                out_path = join(ID_FAILS_DIR, current_presence_page)
-                draw_results(img_gray, signature_box, grid_info, out_path)
-                id_valid = False
-            elif filename_contains_student_id(current_presence_page, student_id):
-                list_etudiant_valide.append(student_id)
-                id_valid = True
+    ##############################################
+    #ecriture dans le fichier xlsx
+
+    append_presence_row(xlsx_path=xlsx_path, image_name=image_name, student_id_grid=student_id_grid, student_id_signature=student_id_signature)
+    
+    ##############################################
+    #return (pour les statistiques)
+    
+    return {
+        "imageName": image_name,
+        "studentID_grid": student_id_grid,
+        "studentID_signature": student_id_signature,
+        "signature_score": signature_score,
+        "has_signature": has_signature,
+        "ink_ratio": ink_ratio,
+        "grid_status": id_result.get("status"),
+    }
+
+
+
+def autoValidPresences(EXAM_FORMXX_PRESENCES, STUDENT_CLASS_SIGNATURES, EXAM_FORMXX_RESULTS):
+    ##############################################
+    #path et directory management
+    presences_dir = Path(EXAM_FORMXX_PRESENCES)
+    results_dir = Path(EXAM_FORMXX_RESULTS)
+
+    if not presences_dir.is_dir():
+        raise FileNotFoundError(f"Répertoire de présences introuvable : {presences_dir}")
+    
+    xlsx_path = results_dir / f"{presences_dir.name}.xlsx"
+    
+    ###############################################
+    #lancement du programme, création du xlsx et loading du model(afin d'éviter de le load à chaque images)
+    print("\n########################################################")
+    print("PROGRAMME 1 : validation des présences")
+    print("output du xlsx :", xlsx_path)
+    
+    create_presence_workbook(xlsx_path)
+
+    try:
+        model = load_similarity_model(MODEL_PATH)
+        print("Modèle de similarité chargé :", MODEL_PATH)
+        print("Clés du modèle :", model.keys())
+
+    except Exception as e:
+        model = None
+        print(f"Pas de modèle de similarité trouvé au path : {MODEL_PATH}")
+        print("Erreur :", e)
+    ###############################################
+    #recuperation des images et initialisation des statistiques
+    image_paths = [
+        p for p in sorted(presences_dir.iterdir())
+        if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTENSIONS
+    ]
+
+    stats = {
+        "total": 0,
+        "grid_read": 0,
+        "signature_read": 0,
+        "grid_signature_match": 0,
+        "grid_signature_mismatch": 0,
+    }
+    
+    ###############################################
+    #main loop for each photos in the choosen form
+    for img_path in image_paths:
+        result = autoValidID(
+            filename_jpg=str(img_path),
+            STUDENT_CLASS_SIGNATURES=STUDENT_CLASS_SIGNATURES,
+            EXAM_FORMXX_PRESENCES_xlsx=str(xlsx_path),
+            EXAM_FORMXX_RESULTS=str(results_dir),
+            model=model,
+        )
+
+        #ajout personnel des statistiques 
+        stats["total"] += 1
+        grid_id = result.get("studentID_grid")
+        sig_id = result.get("studentID_signature")
+
+        if grid_id not in [None, ""]:
+            stats["grid_read"] += 1
+
+        if sig_id not in [None, ""]:
+            stats["signature_read"] += 1
+
+        if grid_id not in [None, ""] and sig_id not in [None, ""]:
+            if str(grid_id) == str(sig_id):
+                stats["grid_signature_match"] += 1
             else:
-                list_etudiant_non_valide.append((student_id, current_presence_page, "id_ne_correspond_pas_au_nom"))
-                out_path = join(ID_FAILS_DIR, current_presence_page)
-                draw_results(img_gray, signature_box, grid_info, out_path)
-                id_valid = False
+                stats["grid_signature_mismatch"] += 1
 
-            # Validation signature
-            if has_signature:
-                list_etudiant_signature.append(student_id)
-                signature_status = "signature_detectee"
+    #print des statistiques
+    print("\nrésumé :", presences_dir.name)
+    print(f"images traitées                 : {stats['total']}")
+    print(f"studentID grid lus             : {stats['grid_read']}/{stats['total']}")
+    print(f"studentID signature prédits      : {stats['signature_read']}/{stats['total']}")
+    print(f"grille/signature identiques      : {stats['grid_signature_match']}")
+    print(f"grille/signature différentes     : {stats['grid_signature_mismatch']}")
+    print("fichier sauvegardé               :", xlsx_path)
 
-                signature_crop = crop_trim_signature(
-                    img_gray,
-                    signature_box
-                )
-                
-                student_id_signature, signature_score, _ = predict_signature_id(
-                    signature_model,
-                    reference_signatures,
-                    signature_crop,
-                    threshold=0.0
-                )
-
-                print("ID signature prédit :", student_id_signature, "score :", signature_score)
-
-                if student_id is not None and student_id_signature is not None:
-                    if str(student_id) == str(student_id_signature):
-                        list_etudiant_dl_valide.append(student_id)
-                        signature_dl_status = "signature_id_match"
-                    else:
-                        list_etudiant_dl_non_valide.append(
-                            (current_presence_page, student_id, student_id_signature, signature_score)
-                        )
-                        signature_dl_status = "signature_id_mismatch"
-                else:
-                    list_etudiant_dl_non_valide.append(
-                        (current_presence_page, student_id, student_id_signature, signature_score)
-                    )
-                    signature_dl_status = "signature_id_missing"
-
-            else:
-                student_id_signature = None
-                signature_score = 0.0
-                signature_dl_status = "signature_non_detectee"
-
-                list_etudiant_non_signature.append((student_id, current_presence_page))
-                out_path = join(SIGNATURE_FAILS_DIR, current_presence_page)
-                draw_results(img_gray, signature_box, grid_info, out_path)
-                signature_status = "signature_non_detectee"
-
-                print("ID signature prédit :", student_id_signature, "score :", signature_score)
-
-            if SAVE_OK_DEBUG and id_valid and has_signature:
-                base, ext = splitext(current_presence_page)
-                out_path = join(DEBUG_OK_DIR, base + "_debug" + ext)
-                draw_results(img_gray, signature_box, grid_info, out_path)
-
-            csv_rows.append([
-                current_presence_page,
-                student_id if student_id is not None else "",
-                student_id_signature if student_id_signature is not None else "",
-            ])
-
-            with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f, delimiter=";")
-                writer.writerow(["imageName","studentID_grid","studentID_signature"])
-                writer.writerows(csv_rows)
-
-    total_id = len(list_etudiant_valide) + len(list_etudiant_non_valide)
-    total_sig = len(list_etudiant_signature) + len(list_etudiant_non_signature)
-
-    print(f"nb étudiant avec ID détécté : {len(list_etudiant_valide)}/{total_id}")
-    print(f"nb étudiant avec ID non détécté : {len(list_etudiant_non_valide)}/{total_id}")
-
-    print(f"nb étudiant avec signature détécté : {len(list_etudiant_signature)}/{total_sig}")
-    print(f"nb étudiant avec signature non détécté : {len(list_etudiant_non_signature)}/{total_sig}")
-
-    print("liste étudiant id detect : ", list_etudiant_valide)
-    print("liste étudiant non id detect : ", list_etudiant_non_valide)
-    print("liste étudiant signature detect : ", list_etudiant_signature)
-    print("liste étudiant non signature detect : ", list_etudiant_non_signature)
-    print("CSV sauvegardé :", OUTPUT_CSV)
-
-
-if __name__ == "__main__":
-    main()
+    return str(xlsx_path)
